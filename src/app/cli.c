@@ -1,4 +1,5 @@
 #include "app/cli.h"
+#include "backend/fastplan.h"
 #include "platform/strutil.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,7 @@ void print_usage(const char* argv0) {
     fprintf(stderr, "  --cpu gekko|broadway|espresso  Select CPU profile (default: broadway)\n");
     fprintf(stderr, "  --gamecube                     GameCube mode (no title ID required)\n");
     fprintf(stderr, "  --rel-base <addr>              Override first virtual load address for REL codegen\n");
+    fprintf(stderr, "  --native-hooks <file>          Guest functions the host runtime may replace (hex list)\n");
     fprintf(stderr, "  --setup                        Download titles database and optionally install wit\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
@@ -208,6 +210,16 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
 
         if (strncmp(arg, "--jobs=", 7) == 0) {
             if (!parse_job_count(arg + 7, &opts->jobs))
+                return 0;
+            continue;
+        }
+
+        if (strcmp(arg, "--native-hooks") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --native-hooks needs a file\n");
+                return 0;
+            }
+            if (!fast_plan_load_native_hooks(argv[++i]))
                 return 0;
             continue;
         }

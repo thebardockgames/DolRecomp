@@ -26,4 +26,13 @@ void emit_instruction(FILE* out, const PPCInst* inst);
 // emit the boilerplate footer
 void emit_footer(FILE* out);
 
+typedef struct FastPlan FastPlan;
+
+// true when the instruction ends a basic block in generated code
+bool emitter_inst_ends_block(const PPCInst* inst);
+
+// emit the function-level (fast) regions of one chunk; see fastplan.h
+int emit_fast_functions(FILE* out, const PPCInst* insts, u32 count, u32 chunk_addr,
+                        const FastPlan* plan);
+
 #endif /* DOLRECOMP_EMITTER_H */

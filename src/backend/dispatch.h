@@ -18,6 +18,10 @@ typedef struct {
 void emit_chunk_prototype(FILE* out, u32 func_addr);
 void function_list_free(FunctionList* list);
 int function_list_add(FunctionList* list, u32 start, u32 end);
-void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point);
+typedef struct FastPlan FastPlan;
+
+// `fast_plan` may be NULL (legacy chunk dispatch only).
+void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point,
+                           const FastPlan* fast_plan);
 
 #endif

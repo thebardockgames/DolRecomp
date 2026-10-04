@@ -10,6 +10,7 @@
 #include "backend/emitter.h"
 #include "backend/dispatch.h"
 #include "backend/codegen.h"
+#include "backend/fastplan.h"
 #include "analysis/code_section.h"
 #include "analysis/embedded_data.h"
 #include "analysis/smc.h"
@@ -82,6 +83,16 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
     u32 file_count = 0;
     FunctionList funcs = {0};
     SMCAnalysis smc = {0};
+    FastPlan fast_plan = {0};
+
+    if (!fast_plan_build(&fast_plan, sections, section_count,
+                         EMIT_CHUNK_INSTRUCTIONS, entry_point)) {
+        fclose(header);
+        fclose(manifest);
+        return 0;
+    }
+    printf("planned %u fast regions over %u chunks\n",
+           fast_plan.region_count, fast_plan.chunk_count);
 
     for (u32 s = 0; s < section_count; s++) {
         const LoadedCodeSection* section = &sections[s];
@@ -106,6 +117,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
             fprintf(stderr, "error: out of memory\n");
             smc_analysis_free(&smc);
             function_list_free(&funcs);
+            fast_plan_free(&fast_plan);
             fclose(header);
             fclose(manifest);
             return 0;
@@ -142,6 +154,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
                 fprintf(stderr, "error: out of memory\n");
                 smc_analysis_free(&smc);
                 function_list_free(&funcs);
+                fast_plan_free(&fast_plan);
                 free(insts);
                 fclose(header);
                 fclose(manifest);
@@ -156,6 +169,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
             fprintf(stderr, "error: out of memory\n");
             smc_analysis_free(&smc);
             function_list_free(&funcs);
+            fast_plan_free(&fast_plan);
             free(insts);
             fclose(header);
             fclose(manifest);
@@ -178,6 +192,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
                 fprintf(stderr, "error: chunk name is too long\n");
                 smc_analysis_free(&smc);
                 function_list_free(&funcs);
+                fast_plan_free(&fast_plan);
                 free(chunk_jobs);
                 free(insts);
                 fclose(header);
@@ -194,6 +209,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
                 fprintf(stderr, "error: chunk path is too long\n");
                 smc_analysis_free(&smc);
                 function_list_free(&funcs);
+                fast_plan_free(&fast_plan);
                 free(chunk_jobs);
                 free(insts);
                 fclose(header);
@@ -206,6 +222,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
                 fprintf(stderr, "error: output include name is too long\n");
                 smc_analysis_free(&smc);
                 function_list_free(&funcs);
+                fast_plan_free(&fast_plan);
                 free(chunk_jobs);
                 free(insts);
                 fclose(header);
@@ -213,10 +230,30 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
                 return 0;
             }
 
+            {
+                char fast_name[128];
+                snprintf(fast_name, sizeof(fast_name), "fast_%04u_%s%u_%08X.c",
+                         file_count, section->label, section->index, func_addr);
+                job->fast_plan = &fast_plan;
+                if (!join_path(job->fast_path, sizeof(job->fast_path), chunks_dir, fast_name)) {
+                    fprintf(stderr, "error: chunk path is too long\n");
+                    smc_analysis_free(&smc);
+                    function_list_free(&funcs);
+                    fast_plan_free(&fast_plan);
+                    free(chunk_jobs);
+                    free(insts);
+                    fclose(header);
+                    fclose(manifest);
+                    return 0;
+                }
+                fprintf(manifest, "// %s/%s\n", chunks_label, fast_name);
+            }
+
             emit_chunk_prototype(header, func_addr);
             if (!function_list_add(&funcs, func_addr, func_addr + chunk_count * 4u)) {
                 smc_analysis_free(&smc);
                 function_list_free(&funcs);
+                fast_plan_free(&fast_plan);
                 free(chunk_jobs);
                 free(insts);
                 fclose(header);
@@ -233,6 +270,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
         if (!run_chunk_jobs(chunk_jobs, section_job_count, jobs)) {
             smc_analysis_free(&smc);
             function_list_free(&funcs);
+            fast_plan_free(&fast_plan);
             free(chunk_jobs);
             free(insts);
             fclose(header);
@@ -262,6 +300,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
                 fprintf(stderr, "error: SMC report path is too long\n");
                 smc_analysis_free(&smc);
                 function_list_free(&funcs);
+                fast_plan_free(&fast_plan);
                 fclose(header);
                 fclose(manifest);
                 return 0;
@@ -269,6 +308,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
             if (!write_smc_report(&smc, smc_report_path)) {
                 smc_analysis_free(&smc);
                 function_list_free(&funcs);
+                fast_plan_free(&fast_plan);
                 fclose(header);
                 fclose(manifest);
                 return 0;
@@ -278,10 +318,26 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
         }
     }
 
-    emit_dispatch_helpers(header, &funcs, entry_point);
+    {
+        char tables_path[1200];
+        if (!join_path(tables_path, sizeof(tables_path), chunks_dir, "fast_tables.c") ||
+            !fast_plan_emit_tables(&fast_plan, tables_path, include_name)) {
+            fprintf(stderr, "error: can't write fast function tables\n");
+            smc_analysis_free(&smc);
+            function_list_free(&funcs);
+            fast_plan_free(&fast_plan);
+            fclose(header);
+            fclose(manifest);
+            return 0;
+        }
+        fprintf(manifest, "// %s/fast_tables.c\n", chunks_label);
+    }
+
+    emit_dispatch_helpers(header, &funcs, entry_point, &fast_plan);
     emit_footer(header);
     smc_analysis_free(&smc);
     function_list_free(&funcs);
+    fast_plan_free(&fast_plan);
     fprintf(manifest, "\n// %u C files\n", file_count);
 
     fclose(header);

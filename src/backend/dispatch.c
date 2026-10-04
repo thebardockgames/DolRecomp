@@ -1,4 +1,5 @@
 #include "backend/dispatch.h"
+#include "backend/fastplan.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -97,7 +98,8 @@ static void emit_lookup_run(FILE* out, const FunctionList* funcs,
     fprintf(out, "    }\n");
 }
 
-void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point) {
+void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point,
+                           const FastPlan* fast_plan) {
     fprintf(out, "\n#define DOLRECOMP_ENTRY_POINT 0x%08Xu\n", entry_point);
     fprintf(out, "\ntypedef void (*DolRecompFunction)(CPUState* ctx);\n");
     fprintf(out, "\nstatic inline DolRecompFunction dolrecomp_find_original(u32 address) {\n");
@@ -108,8 +110,19 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
     }
     fprintf(out, "    return NULL;\n");
     fprintf(out, "}\n");
+    if (fast_plan)
+        fast_plan_emit_declarations(fast_plan, out);
     fprintf(out, "\nstatic inline int dolrecomp_call_original(CPUState* ctx, u32 address) {\n");
-    fprintf(out, "    DolRecompFunction fn = dolrecomp_find_original(address);\n");
+    fprintf(out, "    DolRecompFunction fn = NULL;\n");
+    if (fast_plan) {
+        // Function-level code first; any other address resumes in the
+        // legacy chunk code, which accepts every instruction address.
+        fprintf(out, "    if (dolrecomp_fast_enabled) {\n");
+        fprintf(out, "        u32 entry = dolrecomp_fast_lookup(address);\n");
+        fprintf(out, "        if (entry) fn = dolrecomp_fast_functions[entry - 1u];\n");
+        fprintf(out, "    }\n");
+    }
+    fprintf(out, "    if (!fn) fn = dolrecomp_find_original(address);\n");
     fprintf(out, "    if (!fn) return 0;\n");
     fprintf(out, "    ctx->pc = address;\n");
     fprintf(out, "    fn(ctx);\n");

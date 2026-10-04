@@ -2,8 +2,26 @@
 // Copyright (C) 2026 ExpansionPak
 
 #include "emitter.h"
+#include "fastplan.h"
 
 #include <stdlib.h>
+
+// Function-level emission context; NULL selects the legacy chunk emitter.
+typedef struct {
+    const FastPlan* plan;
+    const PPCInst* insts;   // region instructions
+    u32 count;
+    u32 start;              // region start address
+    u32 end;                // region end address (exclusive)
+    u32 own_chunk;
+} FastEmit;
+
+static void emit_fallback_call(FILE* out, const PPCInst* inst, const char* indent) {
+    // Fast code keeps pc lazily; the chassis fallback reads and advances it.
+    fprintf(out, "%sctx->pc = 0x%08Xu;\n", indent, inst->address);
+    fprintf(out, "%sppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
+            indent, inst->raw, inst->address);
+}
 
 static u32 cr_field_shift(u8 crf) {
     return 4u * (7u - (u32)crf);
@@ -243,7 +261,7 @@ static void emit_psq_load(FILE* out, const PPCInst* inst, bool indexed,
         emit_dform_ea(out, inst->rA, inst->simm, update);
     }
     fprintf(out, ";\n");
-    fprintf(out, "        ppc_psq_load(ctx, %uu, ea, %s, %uu, %s, 0x%08Xu);\n",
+    fprintf(out, "        ppc_psq_load_inline(ctx, %uu, ea, %s, %uu, %s, 0x%08Xu);\n",
             inst->rD, inst->w ? "true" : "false", inst->i,
             indexed ? "true" : "false", inst->address);
     fprintf(out, "        if (ctx->exception) return;\n");
@@ -263,7 +281,7 @@ static void emit_psq_store(FILE* out, const PPCInst* inst, bool indexed,
         emit_dform_ea(out, inst->rA, inst->simm, update);
     }
     fprintf(out, ";\n");
-    fprintf(out, "        ppc_psq_store(ctx, %uu, ea, %s, %uu, %s, 0x%08Xu);\n",
+    fprintf(out, "        ppc_psq_store_inline(ctx, %uu, ea, %s, %uu, %s, 0x%08Xu);\n",
             inst->rS, inst->w ? "true" : "false", inst->i,
             indexed ? "true" : "false", inst->address);
     fprintf(out, "        if (ctx->exception) return;\n");
@@ -319,6 +337,10 @@ static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target
     }
     if (local_backward) {
         fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
+        fprintf(out, "#if GXRUNTIME_CPU_ABI_VERSION >= 3\n");
+        fprintf(out, "            if (ctx->dispatch_budget > 0 && ctx->downcount > -ctx->dispatch_budget &&\n");
+        fprintf(out, "                !ctx->exception && ++local_backedges < 64u) goto label_%08X;\n", inst->branch_target);
+        fprintf(out, "#endif\n");
         fprintf(out, "            return;\n");
     } else if (local_target) {
         fprintf(out, "            goto label_%08X;\n", inst->branch_target);
@@ -339,6 +361,193 @@ static void emit_dynamic_branch(FILE* out, const PPCInst* inst,
     }
     fprintf(out, "            ctx->pc = target;\n");
     fprintf(out, "            return;\n");
+    fprintf(out, "        }\n");
+    fprintf(out, "    }\n");
+}
+
+// --- Function-level (fast) control flow -----------------------------------
+//
+// Invariant: every `return` from a fast function leaves ctx->pc at the guest
+// address where execution continues. A native caller resumes only when the
+// callee returned to the expected return address; otherwise it returns too,
+// unwinding to the dispatcher, which resumes at ctx->pc (a fast entry, or the
+// legacy chunk code for any other address).
+
+static bool fast_is_local(const FastEmit* f, u32 address) {
+    return branch_target_is_local(f->start, f->end, address);
+}
+
+// The chassis replaces this exact SDK byte-copy loop with a bounded host copy
+// when it is dispatched at the loop head, so fast code exits there.
+static bool fast_is_copy_loop_head(const FastEmit* f, u32 address) {
+    u32 i;
+    if (!fast_is_local(f, address))
+        return false;
+    i = (address - f->start) / 4u;
+    if (i + 4u > f->count)
+        return false;
+    return ((f->insts[i].raw == 0x8C040001u && f->insts[i + 1u].raw == 0x9C060001u) ||
+            (f->insts[i].raw == 0x8C04FFFFu && f->insts[i + 1u].raw == 0x9C06FFFFu)) &&
+           f->insts[i + 2u].raw == 0x34A5FFFFu && f->insts[i + 3u].raw == 0x4082FFF4u;
+}
+
+// A loop whose body only loads, compares and branches back cannot make
+// progress by itself: it polls memory written by another thread or by an
+// interrupt (e.g. the SDK idle loop in OSThread). Return to the dispatcher on
+// every iteration, as the legacy code does, so the chassis can deliver events
+// and apply its configured idle-loop skip instead of spinning in host time.
+static bool fast_is_polling_loop(const FastEmit* f, u32 head, const PPCInst* branch) {
+    u32 first, last, i;
+    if (!fast_is_local(f, head) || branch->address < head)
+        return false;
+    first = (head - f->start) / 4u;
+    last = (branch->address - f->start) / 4u;
+    if (last - first > 8u)
+        return false;
+    for (i = first; i < last; i++) {
+        const PPCInst* inst = &f->insts[i];
+        if (inst->embedded_data)
+            return false;
+        switch (inst->op) {
+        case PPC_OP_LWZ:
+        case PPC_OP_LHZ:
+        case PPC_OP_LHA:
+        case PPC_OP_LBZ:
+        case PPC_OP_CMPI:
+        case PPC_OP_CMPLI:
+        case PPC_OP_CMP:
+        case PPC_OP_CMPL:
+        case PPC_OP_ANDI:
+        case PPC_OP_ANDIS:
+        case PPC_OP_RLWINM:
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+static u32 fast_region_of(const FastEmit* f, u32 address) {
+    return f->plan->regions[fast_plan_region_index(f->plan, address)];
+}
+
+// Non-returning transfer to `target` outside this region.
+static void emit_fast_jump(FILE* out, const FastEmit* f, u32 target, const char* ind) {
+    int hook = fast_plan_native_hook_index(f->plan, target);
+    if (hook >= 0) {
+        // A hooked function the runtime took over runs from the dispatcher.
+        fprintf(out, "%sctx->pc = 0x%08Xu;\n", ind, target);
+        fprintf(out, "%sif (!dolrecomp_native_hooks[%d]) ", ind, hook);
+        fprintf(out, "dolrecomp_fast_jump(ctx, fast_%08X, 0x%08Xu, %uu);\n",
+                fast_region_of(f, target), target,
+                (u32)fast_plan_chunk_index(f->plan, target));
+    } else if (fast_plan_is_entry(f->plan, target)) {
+        fprintf(out, "%sdolrecomp_fast_jump(ctx, fast_%08X, 0x%08Xu, %uu);\n", ind,
+                fast_region_of(f, target), target,
+                (u32)fast_plan_chunk_index(f->plan, target));
+    } else {
+        fprintf(out, "%sctx->pc = 0x%08Xu;\n", ind, target);
+    }
+    fprintf(out, "%sreturn;\n", ind);
+}
+
+// Statement continuing at `ret` after a native call returned there normally.
+static void emit_fast_resume(FILE* out, const FastEmit* f, u32 ret) {
+    if (fast_is_local(f, ret))
+        fprintf(out, "goto label_%08X;\n", ret);
+    else if (fast_plan_native_hook_index(f->plan, ret) >= 0)
+        fprintf(out, "{ ctx->pc = 0x%08Xu; if (!dolrecomp_native_hooks[%d]) "
+                     "dolrecomp_fast_jump(ctx, fast_%08X, 0x%08Xu, %uu); }\n",
+                ret, fast_plan_native_hook_index(f->plan, ret), fast_region_of(f, ret), ret,
+                (u32)fast_plan_chunk_index(f->plan, ret));
+    else if (fast_plan_is_entry(f->plan, ret))
+        fprintf(out, "dolrecomp_fast_jump(ctx, fast_%08X, 0x%08Xu, %uu);\n",
+                fast_region_of(f, ret), ret, (u32)fast_plan_chunk_index(f->plan, ret));
+    else
+        fprintf(out, "{}\n");
+}
+
+static void emit_fast_direct_branch(FILE* out, const PPCInst* inst, const FastEmit* f) {
+    const char* ind = "            ";
+    u32 target = inst->branch_target;
+    u32 ret = inst->address + 4u;
+
+    if (inst->lk) {
+        fprintf(out, "%sctx->lr = 0x%08Xu;\n", ind, ret);
+        if (target == ret) {
+            // `bcl 20,31,$+4` only reads the PC.
+            if (fast_is_local(f, ret))
+                fprintf(out, "%sgoto label_%08X;\n", ind, ret);
+            else
+                emit_fast_jump(out, f, ret, ind);
+        } else if (fast_plan_native_hook_index(f->plan, target) >= 0) {
+            // Exit to the dispatcher when the runtime took the function over.
+            fprintf(out, "%sctx->pc = 0x%08Xu;\n", ind, target);
+            fprintf(out, "%sif (!dolrecomp_native_hooks[%d] && "
+                         "dolrecomp_fast_call(ctx, fast_%08X, 0x%08Xu, %uu, 0x%08Xu, %uu)) ",
+                    ind, fast_plan_native_hook_index(f->plan, target),
+                    fast_region_of(f, target), target,
+                    (u32)fast_plan_chunk_index(f->plan, target), ret, f->own_chunk);
+            emit_fast_resume(out, f, ret);
+            fprintf(out, "%sreturn;\n", ind);
+        } else if (fast_plan_is_entry(f->plan, target)) {
+            fprintf(out, "%sif (dolrecomp_fast_call(ctx, fast_%08X, 0x%08Xu, %uu, 0x%08Xu, %uu)) ",
+                    ind, fast_region_of(f, target), target,
+                    (u32)fast_plan_chunk_index(f->plan, target), ret, f->own_chunk);
+            emit_fast_resume(out, f, ret);
+            fprintf(out, "%sreturn;\n", ind);
+        } else {
+            fprintf(out, "%sctx->pc = 0x%08Xu;\n", ind, target);
+            fprintf(out, "%sreturn;\n", ind);
+        }
+        return;
+    }
+
+    if (fast_is_local(f, target)) {
+        if (target > inst->address) {
+            fprintf(out, "%sgoto label_%08X;\n", ind, target);
+        } else if (fast_is_copy_loop_head(f, target) || fast_is_polling_loop(f, target, inst)) {
+            fprintf(out, "%sctx->pc = 0x%08Xu;\n", ind, target);
+            fprintf(out, "%sreturn;\n", ind);
+        } else {
+            fprintf(out, "%sif (dolrecomp_fast_continue(ctx, %uu)) goto label_%08X;\n",
+                    ind, f->own_chunk, target);
+            fprintf(out, "%sctx->pc = 0x%08Xu;\n", ind, target);
+            fprintf(out, "%sreturn;\n", ind);
+        }
+        return;
+    }
+    emit_fast_jump(out, f, target, ind);
+}
+
+static void emit_fast_dynamic_branch(FILE* out, const PPCInst* inst,
+                                     const char* target_expr, const FastEmit* f) {
+    u32 ret = inst->address + 4u;
+
+    fprintf(out, "    {\n");
+    fprintf(out, "        u32 target = %s;\n", target_expr);
+    emit_branch_condition(out, inst->bo, inst->bi);
+    fprintf(out, "        if (ctr_ok && cr_ok) {\n");
+    if (inst->lk) {
+        fprintf(out, "            ctx->lr = 0x%08Xu;\n", ret);
+        fprintf(out, "            if (dolrecomp_fast_call_dynamic(ctx, target, 0x%08Xu, %uu)) ",
+                ret, f->own_chunk);
+        emit_fast_resume(out, f, ret);
+        fprintf(out, "            return;\n");
+    } else if (inst->op == PPC_OP_BCCTR) {
+        // Jump tables usually stay inside the function: re-enter this
+        // region's entry switch instead of growing the host stack.
+        fprintf(out, "            ctx->pc = target;\n");
+        fprintf(out, "            if ((u32)(target - 0x%08Xu) < 0x%08Xu && "
+                     "dolrecomp_fast_continue(ctx, %uu)) goto fast_dispatch;\n",
+                f->start, f->end - f->start, f->own_chunk);
+        fprintf(out, "            dolrecomp_fast_jump_dynamic(ctx, target);\n");
+        fprintf(out, "            return;\n");
+    } else {
+        fprintf(out, "            ctx->pc = target;\n");
+        fprintf(out, "            return;\n");
+    }
     fprintf(out, "        }\n");
     fprintf(out, "    }\n");
 }
@@ -453,19 +662,40 @@ void emit_footer(FILE* out) {
     fprintf(out, "\n#endif /* RECOMP_GENERATED_H */\n\n// end\n");
 }
 
+/* Fast regions: whether MSR.FP was already verified on every path reaching
+ * the current instruction since the last label (block leader, entry, branch
+ * target). Only mtmsr, rfi, sc and exception entry change MSR.FP; those leave
+ * the block (or are mtmsr, which clears this), and every label clears it. */
+#if defined(_MSC_VER)
+#define DOLRECOMP_THREAD_LOCAL __declspec(thread)
+#else
+#define DOLRECOMP_THREAD_LOCAL _Thread_local
+#endif
+/* Per generator thread: regions are emitted in parallel (-j). */
+static DOLRECOMP_THREAD_LOCAL bool s_fast_fp_verified;
+static bool inst_ends_block(const PPCInst* inst);
+
 static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
-                                        u32 func_start, u32 func_end) {
+                                        u32 func_start, u32 func_end,
+                                        const FastEmit* fast) {
     char disasm[64];
     ppc_disasm(disasm, sizeof(disasm), inst);
     fprintf(out, "    // %08X: %s\n", inst->address, disasm);
 
     if (inst->embedded_data) {
         fprintf(out, "    // embedded data\n\n");
+        s_fast_fp_verified = false;
         return;
     }
 
-    if (ppc_op_uses_fpu(inst->op))
-        fprintf(out, "    if (!ppc_fp_available(ctx, 0x%08Xu)) return;\n", inst->address);
+    if (ppc_op_uses_fpu(inst->op) && !(fast && s_fast_fp_verified)) {
+        // MSR.FP enabled is the helper's unconditional side-effect-free case.
+        // Keep its original slow path for disabled FP, including lazy-FP mode.
+        fprintf(out, "    if ((ctx->msr & 0x00002000u) == 0 && !ppc_fp_available(ctx, 0x%08Xu)) return;\n", inst->address);
+        s_fast_fp_verified = fast != NULL;
+    }
+    if (inst->op == PPC_OP_MTMSR || inst_ends_block(inst))
+        s_fast_fp_verified = false;
 
     switch (inst->op) {
     case PPC_OP_MULLI:
@@ -1231,18 +1461,19 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
 
     case PPC_OP_PS_SUM1:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n",
-                inst->rD, inst->rC);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] + (f32)ctx->ps1[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
+        fprintf(out, "    { f64 lane0 = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rC);
+        fprintf(out, "      f64 lane1 = dolrecomp_ps_round((f32)ctx->fpr[%u] + (f32)ctx->ps1[%u]);\n",
+                inst->rA, inst->rB);
+        fprintf(out, "      ctx->fpr[%u] = lane0; ctx->ps1[%u] = lane1; }\n", inst->rD, inst->rD);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MULS0:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rC);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rC);
+        fprintf(out, "    { f64 lane0 = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->fpr[%u]);\n",
+                inst->rA, inst->rC);
+        fprintf(out, "      f64 lane1 = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->fpr[%u]);\n",
+                inst->rA, inst->rC);
+        fprintf(out, "      ctx->fpr[%u] = lane0; ctx->ps1[%u] = lane1; }\n", inst->rD, inst->rD);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
@@ -1255,10 +1486,11 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
 
     case PPC_OP_PS_MADDS0:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->fpr[%u] + (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rC, inst->rB);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->fpr[%u] + (f32)ctx->ps1[%u]);\n",
-                inst->rD, inst->rA, inst->rC, inst->rB);
+        fprintf(out, "    { f64 lane0 = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->fpr[%u] + (f32)ctx->fpr[%u]);\n",
+                inst->rA, inst->rC, inst->rB);
+        fprintf(out, "      f64 lane1 = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->fpr[%u] + (f32)ctx->ps1[%u]);\n",
+                inst->rA, inst->rC, inst->rB);
+        fprintf(out, "      ctx->fpr[%u] = lane0; ctx->ps1[%u] = lane1; }\n", inst->rD, inst->rD);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
@@ -1271,8 +1503,9 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
 
     case PPC_OP_PS_MERGE00:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rB);
+        fprintf(out, "    { f64 lane0 = dolrecomp_ps_round(ctx->fpr[%u]); f64 lane1 = dolrecomp_ps_round(ctx->fpr[%u]);\n",
+                inst->rA, inst->rB);
+        fprintf(out, "      ctx->fpr[%u] = lane0; ctx->ps1[%u] = lane1; }\n", inst->rD, inst->rD);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
@@ -1283,8 +1516,9 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
 
     case PPC_OP_PS_MERGE10:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rB);
+        fprintf(out, "    { f64 lane0 = dolrecomp_ps_round(ctx->ps1[%u]); f64 lane1 = dolrecomp_ps_round(ctx->fpr[%u]);\n",
+                inst->rA, inst->rB);
+        fprintf(out, "      ctx->fpr[%u] = lane0; ctx->ps1[%u] = lane1; }\n", inst->rD, inst->rD);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
@@ -1506,8 +1740,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_DCBF:
     case PPC_OP_DCBI:
     case PPC_OP_ICBI:
-        fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
-                inst->raw, inst->address);
+        emit_fallback_call(out, inst, "    ");
         fprintf(out, "    return;\n");
         break;
 
@@ -1538,8 +1771,11 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
 
     case PPC_OP_B:
         fprintf(out, "    {\n");
-        emit_direct_branch(out, inst,
-                           branch_target_is_local(func_start, func_end, inst->branch_target));
+        if (fast)
+            emit_fast_direct_branch(out, inst, fast);
+        else
+            emit_direct_branch(out, inst,
+                               branch_target_is_local(func_start, func_end, inst->branch_target));
         fprintf(out, "    }\n");
         break;
 
@@ -1547,18 +1783,27 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         fprintf(out, "    {\n");
         emit_branch_condition(out, inst->bo, inst->bi);
         fprintf(out, "        if (ctr_ok && cr_ok) {\n");
-        emit_direct_branch(out, inst,
-                           branch_target_is_local(func_start, func_end, inst->branch_target));
+        if (fast)
+            emit_fast_direct_branch(out, inst, fast);
+        else
+            emit_direct_branch(out, inst,
+                               branch_target_is_local(func_start, func_end, inst->branch_target));
         fprintf(out, "        }\n");
         fprintf(out, "    }\n");
         break;
 
     case PPC_OP_BCLR:
-        emit_dynamic_branch(out, inst, "ctx->lr & ~3u");
+        if (fast)
+            emit_fast_dynamic_branch(out, inst, "ctx->lr & ~3u", fast);
+        else
+            emit_dynamic_branch(out, inst, "ctx->lr & ~3u");
         break;
 
     case PPC_OP_BCCTR:
-        emit_dynamic_branch(out, inst, "ctx->ctr & ~3u");
+        if (fast)
+            emit_fast_dynamic_branch(out, inst, "ctx->ctr & ~3u", fast);
+        else
+            emit_dynamic_branch(out, inst, "ctx->ctr & ~3u");
         break;
 
     case PPC_OP_TWI:
@@ -1693,8 +1938,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         case 282: fprintf(out, "    ctx->gpr[%u] = ctx->ear;\n", inst->rD); break;
         case 920: fprintf(out, "    ctx->gpr[%u] = ctx->hid2;\n", inst->rD); break;
         default:
-            fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
-                    inst->raw, inst->address);
+            emit_fallback_call(out, inst, "    ");
             fprintf(out, "    return;\n");
             break;
         }
@@ -1718,8 +1962,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         case 919: fprintf(out, "    ctx->gqr[7] = ctx->gpr[%u];\n", inst->rS); break;
         case 920: fprintf(out, "    ctx->hid2 = ctx->gpr[%u];\n", inst->rS); break;
         default:
-            fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
-                    inst->raw, inst->address);
+            emit_fallback_call(out, inst, "    ");
             fprintf(out, "    return;\n");
             break;
         }
@@ -1760,8 +2003,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
 
     default:
-        fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
-                inst->raw, inst->address);
+        emit_fallback_call(out, inst, "    ");
         fprintf(out, "    return;\n");
         break;
     }
@@ -1770,7 +2012,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
 }
 
 void emit_instruction(FILE* out, const PPCInst* inst) {
-    emit_instruction_with_range(out, inst, 0, (u32)-1);
+    emit_instruction_with_range(out, inst, 0, (u32)-1, NULL);
 }
 
 static bool mfspr_is_modeled(u16 spr) {
@@ -1916,6 +2158,7 @@ void emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     }
 
     fprintf(out, "void func_%08X(CPUState* ctx) {\n", func_addr);
+    fprintf(out, "    unsigned local_backedges = 0; (void)local_backedges;\n");
     fprintf(out, "    switch (ctx->pc) {\n");
     for (i = 0; i < count; i++) {
         fprintf(out, "    case 0x%08Xu: goto label_%08X;\n",
@@ -1929,7 +2172,7 @@ void emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
         fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
         if (leader[i] && block_cost[i] != 0)
             fprintf(out, "    ctx->downcount -= %u;\n", block_cost[i]);
-        emit_instruction_with_range(out, &insts[i], func_addr, func_end);
+        emit_instruction_with_range(out, &insts[i], func_addr, func_end, NULL);
     }
 
     free(leader);
@@ -1937,4 +2180,185 @@ void emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
 
     fprintf(out, "    ctx->pc = 0x%08Xu;\n", func_end);
     fprintf(out, "}\n\n");
+}
+
+bool emitter_inst_ends_block(const PPCInst* inst) {
+    return inst_ends_block(inst);
+}
+
+static bool inst_reads_timebase(const PPCInst* inst) {
+    return inst->op == PPC_OP_MFTB ||
+           (inst->op == PPC_OP_MFSPR && (inst->spr == 268 || inst->spr == 269));
+}
+
+
+// One region: `insts` covers exactly [plan->regions[region], region end).
+static int emit_fast_region(FILE* out, const FastPlan* plan, const PPCInst* insts,
+                            u32 count, u32 region) {
+    FastEmit f;
+    u32 i;
+    bool has_local_jump_table = false;
+    u8* leader = (u8*)calloc(count ? count : 1u, 1u);
+    u8* goto_label = (u8*)calloc(count ? count : 1u, 1u);
+    u8* entry = (u8*)calloc(count ? count : 1u, 1u);
+    u32* block_cost = (u32*)calloc(count ? count : 1u, sizeof(u32));
+    u8* fp_entry_stub = (u8*)calloc(count ? count : 1u, 1u);
+    if (!leader || !goto_label || !entry || !block_cost || !fp_entry_stub) {
+        free(leader);
+        free(goto_label);
+        free(entry);
+        free(block_cost);
+        free(fp_entry_stub);
+        fprintf(stderr, "error: out of memory\n");
+        return 0;
+    }
+
+    f.plan = plan;
+    f.insts = insts;
+    f.count = count;
+    f.start = plan->regions[region];
+    f.end = fast_plan_region_end(plan, region);
+    f.own_chunk = (u32)fast_plan_chunk_index(plan, f.start);
+
+    // Leaders: region start, entries, block successors and local branch
+    // targets. Every entry is a leader so cycle charges stay per-block exact.
+    if (count)
+        leader[0] = 1;
+    for (i = 0; i < count; i++) {
+        const PPCInst* inst = &insts[i];
+        if (fast_plan_is_entry(plan, inst->address))
+            entry[i] = leader[i] = 1;
+        if (inst->embedded_data)
+            continue;
+        if (inst_ends_block(inst) && i + 1u < count)
+            leader[i + 1u] = 1;
+        if ((inst->op == PPC_OP_B || inst->op == PPC_OP_BC) &&
+            fast_is_local(&f, inst->branch_target)) {
+            u32 t = (inst->branch_target - f.start) / 4u;
+            leader[t] = 1;
+            if (!inst->lk || inst->branch_target == inst->address + 4u)
+                goto_label[t] = 1;
+        }
+        if (inst->lk && i + 1u < count)
+            goto_label[i + 1u] = 1;
+        if (inst->op == PPC_OP_BCCTR && !inst->lk)
+            has_local_jump_table = true;
+    }
+    for (i = 0; i < count; i++) {
+        u32 j;
+        if (!leader[i])
+            continue;
+        for (j = i;;) {
+            block_cost[i] += inst_cycle_cost(&insts[j]);
+            if (inst_ends_block(&insts[j]))
+                break;
+            j++;
+            if (j >= count || leader[j])
+                break;
+        }
+    }
+
+    // MSR.FP checks: once per straight-line path. Instructions that can fault
+    // are dispatcher entries (resumed after the exception), so most labels
+    // here are entries; a fall-through path that verified MSR.FP needs no
+    // check, the entry path gets its own (fp_entry_stub). Local branch
+    // targets, timebase entries and other entries start unverified.
+    {
+        bool verified = false;
+        for (i = 0; i < count; i++) {
+            const PPCInst* inst = &insts[i];
+            const bool fp = !inst->embedded_data && ppc_op_uses_fpu(inst->op);
+            if (goto_label[i] || (entry[i] && inst_reads_timebase(inst)))
+                verified = false;
+            else if (entry[i]) {
+                if (fp && verified)
+                    fp_entry_stub[i] = 1;
+                else
+                    verified = false;
+            }
+            if (fp)
+                verified = true;
+            if (inst->embedded_data || inst->op == PPC_OP_MTMSR || inst_ends_block(inst))
+                verified = false;
+        }
+    }
+
+    fprintf(out, "void fast_%08X(CPUState* ctx) {\n", f.start);
+    s_fast_fp_verified = false;
+    if (has_local_jump_table)
+        fprintf(out, "fast_dispatch:\n");
+    fprintf(out, "    switch (ctx->pc) {\n");
+    for (i = 0; i < count; i++) {
+        if (!entry[i])
+            continue;
+        fprintf(out, "    case 0x%08Xu: ", insts[i].address);
+        // Diagnostic builds count entries at the region (function) start.
+        if (i == 0)
+            fprintf(out, "DOLRECOMP_COUNT_ENTRY(%uu); ", region);
+        if (inst_reads_timebase(&insts[i]))
+            fprintf(out, "if (dolrecomp_fast_depth == 0u) goto entry_%08X; goto label_%08X;\n",
+                    insts[i].address, insts[i].address);
+        else if (fp_entry_stub[i])
+            fprintf(out, "goto fpentry_%08X;\n", insts[i].address);
+        else
+            fprintf(out, "goto label_%08X;\n", insts[i].address);
+    }
+    fprintf(out, "    default: return;\n");
+    fprintf(out, "    }\n");
+
+    for (i = 0; i < count; i++) {
+        const PPCInst* inst = &insts[i];
+        bool timebase = entry[i] && inst_reads_timebase(inst);
+        if (fp_entry_stub[i]) {
+            // Entered from the dispatcher: check MSR.FP here; the fall-through
+            // path above has already verified it.
+            fprintf(out, "    goto label_%08X;\n", inst->address);
+            fprintf(out, "fpentry_%08X:\n", inst->address);
+            fprintf(out, "    if ((ctx->msr & 0x00002000u) == 0 && !ppc_fp_available(ctx, 0x%08Xu)) return;\n",
+                    inst->address);
+        }
+        if (goto_label[i] || entry[i])
+            fprintf(out, "label_%08X:\n", inst->address);
+        if (goto_label[i] || (entry[i] && !fp_entry_stub[i]))
+            s_fast_fp_verified = false;
+        if (timebase) {
+            // The chassis refreshes ctx->timebase once per dispatch. A TB read
+            // runs only when entered straight from the dispatcher (depth 0);
+            // native flow exits first so the read observes current time.
+            fprintf(out, "    ctx->pc = 0x%08Xu;\n    return;\n", inst->address);
+            fprintf(out, "entry_%08X:\n", inst->address);
+        }
+        if (leader[i] && block_cost[i] != 0)
+            fprintf(out, "    ctx->downcount -= %u;\n", block_cost[i]);
+        emit_instruction_with_range(out, inst, f.start, f.end, &f);
+    }
+    emit_fast_jump(out, &f, f.end, "    ");
+    fprintf(out, "}\n\n");
+
+    free(leader);
+    free(goto_label);
+    free(entry);
+    free(block_cost);
+    free(fp_entry_stub);
+    return 1;
+}
+
+int emit_fast_functions(FILE* out, const PPCInst* insts, u32 count, u32 chunk_addr,
+                        const FastPlan* plan) {
+    u32 chunk_end = chunk_addr + count * 4u;
+    int region = fast_plan_region_index(plan, chunk_addr);
+    if (region < 0 || plan->regions[region] != chunk_addr) {
+        fprintf(stderr, "error: chunk 0x%08X does not start a fast region\n", chunk_addr);
+        return 0;
+    }
+    for (u32 r = (u32)region; r < plan->region_count && plan->regions[r] < chunk_end; r++) {
+        u32 start = plan->regions[r];
+        u32 end = fast_plan_region_end(plan, r);
+        if (end > chunk_end)
+            end = chunk_end;
+        if (!emit_fast_region(out, plan, insts + (start - chunk_addr) / 4u,
+                              (end - start) / 4u, r))
+            return 0;
+    }
+    return 1;
 }

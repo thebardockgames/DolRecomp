@@ -38,6 +38,22 @@ int emit_chunk_file(const ChunkJob* job) {
         return 0;
     }
 
+    if (job->fast_plan) {
+        FILE* fast = fopen(job->fast_path, "w");
+        int ok;
+        if (!fast) {
+            fprintf(stderr, "error: can't open output '%s'\n", job->fast_path);
+            return 0;
+        }
+        fprintf(fast, "// DolRecomp output: function-level code\n");
+        fprintf(fast, "#include \"../%s\"\n\n", job->include_name);
+        ok = emit_fast_functions(fast, job->insts, job->count, job->func_addr, job->fast_plan);
+        if (fclose(fast) != 0 || !ok) {
+            fprintf(stderr, "error: failed writing '%s'\n", job->fast_path);
+            return 0;
+        }
+    }
+
     return 1;
 }
 
