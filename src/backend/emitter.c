@@ -3,6 +3,7 @@
 
 #include "emitter.h"
 #include "fastplan.h"
+#include "regcache.h"
 
 #include <stdlib.h>
 
@@ -482,8 +483,14 @@ static void emit_fast_direct_branch(FILE* out, const PPCInst* inst, const FastEm
             else
                 emit_fast_jump(out, f, ret, ind);
         } else if (fast_plan_native_hook_index(f->plan, target) >= 0) {
-            // Exit to the dispatcher when the runtime took the function over.
+            // An inline native replacement runs in place; otherwise exit to
+            // the dispatcher when the runtime took the function over.
             fprintf(out, "%sctx->pc = 0x%08Xu;\n", ind, target);
+            fprintf(out, "%sif (dolrecomp_native_inline[%d] && dolrecomp_fast_continue(ctx, %uu) && "
+                         "dolrecomp_native_inline[%d](ctx)) ",
+                    ind, fast_plan_native_hook_index(f->plan, target),
+                    (u32)fast_plan_chunk_index(f->plan, target), fast_plan_native_hook_index(f->plan, target));
+            emit_fast_resume(out, f, ret);
             fprintf(out, "%sif (!dolrecomp_native_hooks[%d] && "
                          "dolrecomp_fast_call(ctx, fast_%08X, 0x%08Xu, %uu, 0x%08Xu, %uu)) ",
                     ind, fast_plan_native_hook_index(f->plan, target),
@@ -2193,8 +2200,13 @@ static bool inst_reads_timebase(const PPCInst* inst) {
 
 
 // One region: `insts` covers exactly [plan->regions[region], region end).
-static int emit_fast_region(FILE* out, const FastPlan* plan, const PPCInst* insts,
-                            u32 count, u32 region) {
+static void regcache_mark(FILE* out, bool begin) {
+    if (regcache_enabled())
+        fputs(begin ? REGCACHE_BEGIN : REGCACHE_END, out);
+}
+
+static int emit_fast_region_text(FILE* out, const FastPlan* plan, const PPCInst* insts,
+                                 u32 count, u32 region) {
     FastEmit f;
     u32 i;
     bool has_local_jump_table = false;
@@ -2312,10 +2324,14 @@ static int emit_fast_region(FILE* out, const FastPlan* plan, const PPCInst* inst
         if (fp_entry_stub[i]) {
             // Entered from the dispatcher: check MSR.FP here; the fall-through
             // path above has already verified it.
+            regcache_mark(out, true);
             fprintf(out, "    goto label_%08X;\n", inst->address);
+            regcache_mark(out, false);
             fprintf(out, "fpentry_%08X:\n", inst->address);
+            regcache_mark(out, true);
             fprintf(out, "    if ((ctx->msr & 0x00002000u) == 0 && !ppc_fp_available(ctx, 0x%08Xu)) return;\n",
                     inst->address);
+            regcache_mark(out, false);
         }
         if (goto_label[i] || entry[i])
             fprintf(out, "label_%08X:\n", inst->address);
@@ -2325,14 +2341,20 @@ static int emit_fast_region(FILE* out, const FastPlan* plan, const PPCInst* inst
             // The chassis refreshes ctx->timebase once per dispatch. A TB read
             // runs only when entered straight from the dispatcher (depth 0);
             // native flow exits first so the read observes current time.
+            regcache_mark(out, true);
             fprintf(out, "    ctx->pc = 0x%08Xu;\n    return;\n", inst->address);
+            regcache_mark(out, false);
             fprintf(out, "entry_%08X:\n", inst->address);
         }
         if (leader[i] && block_cost[i] != 0)
             fprintf(out, "    ctx->downcount -= %u;\n", block_cost[i]);
+        regcache_mark(out, true);
         emit_instruction_with_range(out, inst, f.start, f.end, &f);
+        regcache_mark(out, false);
     }
+    regcache_mark(out, true);
     emit_fast_jump(out, &f, f.end, "    ");
+    regcache_mark(out, false);
     fprintf(out, "}\n\n");
 
     free(leader);
@@ -2341,6 +2363,39 @@ static int emit_fast_region(FILE* out, const FastPlan* plan, const PPCInst* inst
     free(block_cost);
     free(fp_entry_stub);
     return 1;
+}
+
+// With the register cache the region goes through a temporary file and is
+// rewritten by regcache_rewrite (see regcache.h).
+static int emit_fast_region(FILE* out, const FastPlan* plan, const PPCInst* insts,
+                            u32 count, u32 region) {
+    FILE* tmp;
+    long size;
+    char* text;
+    int ok;
+    if (!regcache_enabled())
+        return emit_fast_region_text(out, plan, insts, count, region);
+    tmp = tmpfile();
+    if (!tmp) {
+        fprintf(stderr, "error: can't create a temporary file\n");
+        return 0;
+    }
+    ok = emit_fast_region_text(tmp, plan, insts, count, region);
+    size = ftell(tmp);
+    text = ok && size >= 0 ? (char*)malloc((size_t)size + 1u) : NULL;
+    if (text) {
+        rewind(tmp);
+        ok = fread(text, 1, (size_t)size, tmp) == (size_t)size;
+        text[size] = 0;
+        ok = ok && regcache_rewrite(out, text);
+    } else {
+        ok = 0;
+    }
+    if (!ok)
+        fprintf(stderr, "error: register cache rewrite failed\n");
+    free(text);
+    fclose(tmp);
+    return ok;
 }
 
 int emit_fast_functions(FILE* out, const PPCInst* insts, u32 count, u32 chunk_addr,

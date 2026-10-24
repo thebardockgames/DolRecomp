@@ -1,6 +1,7 @@
 #include "app/cli.h"
 #include "backend/fastplan.h"
 #include "platform/strutil.h"
+#include "backend/regcache.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,7 @@ void print_usage(const char* argv0) {
     fprintf(stderr, "  --gamecube                     GameCube mode (no title ID required)\n");
     fprintf(stderr, "  --rel-base <addr>              Override first virtual load address for REL codegen\n");
     fprintf(stderr, "  --native-hooks <file>          Guest functions the host runtime may replace (hex list)\n");
+    fprintf(stderr, "  --register-cache               Keep guest registers in C locals inside fast regions\n");
     fprintf(stderr, "  --setup                        Download titles database and optionally install wit\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
@@ -211,6 +213,11 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
         if (strncmp(arg, "--jobs=", 7) == 0) {
             if (!parse_job_count(arg + 7, &opts->jobs))
                 return 0;
+            continue;
+        }
+
+        if (strcmp(arg, "--register-cache") == 0) {
+            regcache_set_enabled(true);
             continue;
         }
 

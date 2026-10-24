@@ -80,6 +80,7 @@ add_library(dr_backend STATIC
     src/backend/dispatch.c
     src/backend/codegen.c
     src/backend/fastplan.c
+    src/backend/regcache.c
 )
 target_include_directories(dr_backend PUBLIC ${DOLRECOMP_SRC})
 target_link_libraries(dr_backend PUBLIC dr_frontend dr_analysis)

@@ -332,6 +332,12 @@ void fast_plan_emit_declarations(const FastPlan* plan, FILE* out) {
             "extern unsigned char dolrecomp_native_hooks[];\n"
             "extern const u32 dolrecomp_native_hook_addresses[];\n"
             "extern int dolrecomp_native_hooks_any;\n"
+            "// Inline native replacements: a direct call into hooked function k\n"
+            "// runs dolrecomp_native_inline[k] in place (no dispatcher round trip)\n"
+            "// when the runtime installed one and it returns nonzero; the state\n"
+            "// is then that of the function's return.\n"
+            "typedef int (*DolRecompNativeInline)(CPUState* ctx);\n"
+            "extern DolRecompNativeInline dolrecomp_native_inline[];\n"
             "\n"
             "static inline int dolrecomp_native_hooked(u32 address) {\n"
             "    u32 lo = 0u, hi = DOLRECOMP_NATIVE_HOOK_COUNT;\n"
@@ -460,6 +466,7 @@ int fast_plan_emit_tables(const FastPlan* plan, const char* path,
     if (plan->hook_count) {
         fprintf(out, "\n// Native hook flags, set by the runtime before code runs.\n");
         fprintf(out, "unsigned char dolrecomp_native_hooks[%uu];\n", plan->hook_count);
+        fprintf(out, "DolRecompNativeInline dolrecomp_native_inline[%uu];\n", plan->hook_count);
         fprintf(out, "int dolrecomp_native_hooks_any;\n");
         fprintf(out, "const u32 dolrecomp_native_hook_addresses[] = {\n");
         for (u32 h = 0; h < plan->hook_count; h++)
